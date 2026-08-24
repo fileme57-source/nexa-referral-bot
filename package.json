@@ -1,0 +1,18 @@
+{
+  "name": "nexa-referral-bot",
+  "version": "1.0.0",
+  "description": "Referral tracking bot for the Nexa Prop Firm Telegram channel — auto-generates personal invite links, tracks joins, and rewards Nexa Points convertible to a discount.",
+  "type": "module",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "telegraf": "^4.16.3",
+    "lowdb": "^7.0.1",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
