@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { Telegraf } from 'telegraf';
+import { Telegraf, Markup } from 'telegraf';
 import { JSONFilePreset } from 'lowdb/node';
 
 // ---------------------------------------------------------------------------
@@ -18,6 +18,11 @@ if (!BOT_TOKEN || !CHANNEL_ID) {
   console.error('❌ Missing BOT_TOKEN or CHANNEL_ID in your .env file. Check .env.example.');
   process.exit(1);
 }
+
+// Catch anything that slips through so a single bad send doesn't kill the process
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled rejection:', err);
+});
 
 // Discount tiers — edit these to match your pricing. Points are cumulative (lifetime).
 // Sorted ascending; the bot picks the highest tier the user qualifies for.
@@ -43,6 +48,28 @@ function nextTierInfo(points) {
   if (!next) return null;
   return { pointsNeeded: next.points - points, discount: next.discount };
 }
+
+// Escapes Markdown special chars (mainly underscores in usernames) so
+// Telegram's parser doesn't choke and reject the whole message.
+function escapeMarkdown(str) {
+  return String(str).replace(/([_*[\]()~`>#+=|{}.!-])/g, '\\$1');
+}
+
+// Escapes text for safe use inside Telegram HTML-parse-mode messages
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+// Shared inline keyboard shown under the welcome message and reusable elsewhere
+const mainMenuKeyboard = Markup.inlineKeyboard([
+  [Markup.button.callback('🔗 My Link', 'mylink')],
+  [Markup.button.callback('💰 Balance', 'balance')],
+  [Markup.button.callback('🏆 Leaderboard', 'leaderboard')],
+  [Markup.button.callback('❓ Help', 'help')],
+]);
 
 // ---------------------------------------------------------------------------
 // DATABASE (lowdb — simple JSON file, no native deps, easy to host anywhere)
@@ -99,6 +126,83 @@ function isAdmin(ctx) {
   return ADMIN_IDS.includes(String(ctx.from.id));
 }
 
+// ---------------------------------------------------------------------------
+// SHARED HANDLER LOGIC
+// Each of these is called from BOTH the /command version and the button
+// (bot.action) version below, so the behavior always stays in sync.
+// ---------------------------------------------------------------------------
+
+async function sendMyLink(ctx) {
+  const user = await getOrCreateUser(ctx);
+  const link = await ensureInviteLink(ctx, user);
+  if (!link) return ctx.reply('⚠️ Could not fetch your link right now, try again shortly.');
+  await ctx.reply(`🔗 Your referral link:\n${link}`);
+}
+
+async function sendBalance(ctx) {
+  const user = await getOrCreateUser(ctx);
+  const discount = getDiscountForPoints(user.points);
+  const next = nextTierInfo(user.points);
+
+  let msg =
+    `💰 *Nexa Points Balance*\n\n` +
+    `Points: *${user.points}*\n` +
+    `Current discount: *${discount}%*\n`;
+
+  if (next) {
+    msg += `\nEarn *${next.pointsNeeded} more points* to unlock *${next.discount}% off*.`;
+  } else {
+    msg += `\n🏆 You're at the top tier!`;
+  }
+
+  await ctx.reply(msg, { parse_mode: 'Markdown' });
+}
+
+async function sendLeaderboard(ctx) {
+  const top = Object.values(db.data.users)
+    .sort((a, b) => b.points - a.points)
+    .slice(0, 10);
+
+  if (top.length === 0) return ctx.reply('No referrals yet — be the first!');
+
+  const lines = top.map((u, i) => {
+    // Escape the name so a stray "_" (like @scientist_te) can't break
+    // Telegram's Markdown parser and crash the send.
+    const rawName = u.username ? `@${u.username}` : u.firstName || 'Anonymous';
+    const name = escapeMarkdown(rawName);
+    return `${i + 1}. ${name} — ${u.points} pts`;
+  });
+
+  const text = `🏆 *Top Referrers*\n\n${lines.join('\n')}`;
+
+  try {
+    await ctx.reply(text, { parse_mode: 'Markdown' });
+  } catch (err) {
+    console.error('Failed to send leaderboard (Markdown), retrying as plain text:', err.description || err.message);
+    try {
+      // Fallback: strip all formatting so a bad character can never crash this again
+      await ctx.reply(text.replace(/[_*[\]()~`>#+=|{}.!\\-]/g, ''));
+    } catch (fallbackErr) {
+      console.error('Leaderboard fallback send also failed:', fallbackErr.description || fallbackErr.message);
+    }
+  }
+}
+
+async function sendHelp(ctx) {
+  await ctx.reply(
+    `*How the Nexa Referral Program works*\n\n` +
+      `1. Run /start to get your unique invite link\n` +
+      `2. Share it with friends\n` +
+      `3. When they join t.me/${CHANNEL_USERNAME} through YOUR link, you get ${POINTS_PER_REFERRAL} points automatically\n` +
+      `4. Points unlock bigger discounts on Nexa evaluations — check /balance anytime`,
+    { parse_mode: 'Markdown' }
+  );
+}
+
+// ---------------------------------------------------------------------------
+// COMMANDS (typed by user)
+// ---------------------------------------------------------------------------
+
 bot.start(async (ctx) => {
   const user = await getOrCreateUser(ctx);
 
@@ -129,67 +233,39 @@ bot.start(async (ctx) => {
     `👋 Welcome to Nexa Prop Firm, ${user.firstName}!\n\n` +
       `🔗 *Your personal referral link:*\n${link}\n\n` +
       `Share this link. When someone joins the channel through it, you automatically earn *${POINTS_PER_REFERRAL} Nexa Points*.\n\n` +
-      `💰 Your current balance: *${user.points} points* → *${discount}% discount*\n\n` +
-      `Commands:\n` +
-      `/mylink – get your referral link again\n` +
-      `/balance – check your points & discount\n` +
-      `/leaderboard – see the top referrers\n` +
-      `/help – how this works`,
-    { parse_mode: 'Markdown' }
+      `💰 Your current balance: *${user.points} points* → *${discount}% discount*`,
+    { parse_mode: 'Markdown', ...mainMenuKeyboard }
   );
 });
 
-bot.command('mylink', async (ctx) => {
-  const user = await getOrCreateUser(ctx);
-  const link = await ensureInviteLink(ctx, user);
-  if (!link) return ctx.reply('⚠️ Could not fetch your link right now, try again shortly.');
-  await ctx.reply(`🔗 Your referral link:\n${link}`);
+bot.command('mylink', sendMyLink);
+bot.command('balance', sendBalance);
+bot.command('leaderboard', sendLeaderboard);
+bot.help(sendHelp);
+
+// ---------------------------------------------------------------------------
+// BUTTON TAPS (inline keyboard callbacks)
+// ---------------------------------------------------------------------------
+
+bot.action('mylink', async (ctx) => {
+  await ctx.answerCbQuery();
+  await sendMyLink(ctx);
 });
 
-bot.command('balance', async (ctx) => {
-  const user = await getOrCreateUser(ctx);
-  const discount = getDiscountForPoints(user.points);
-  const next = nextTierInfo(user.points);
-
-  let msg =
-    `💰 *Nexa Points Balance*\n\n` +
-    `Points: *${user.points}*\n` +
-    `Current discount: *${discount}%*\n`;
-
-  if (next) {
-    msg += `\nEarn *${next.pointsNeeded} more points* to unlock *${next.discount}% off*.`;
-  } else {
-    msg += `\n🏆 You're at the top tier!`;
-  }
-
-  await ctx.reply(msg, { parse_mode: 'Markdown' });
+bot.action('balance', async (ctx) => {
+  await ctx.answerCbQuery();
+  await sendBalance(ctx);
 });
 
-bot.command('leaderboard', async (ctx) => {
-  const top = Object.values(db.data.users)
-    .sort((a, b) => b.points - a.points)
-    .slice(0, 10);
-
-  if (top.length === 0) return ctx.reply('No referrals yet — be the first!');
-
-  const lines = top.map((u, i) => {
-    const name = u.username ? `@${u.username}` : u.firstName || 'Anonymous';
-    return `${i + 1}. ${name} — ${u.points} pts`;
-  });
-
-  await ctx.reply(`🏆 *Top Referrers*\n\n${lines.join('\n')}`, { parse_mode: 'Markdown' });
+bot.action('leaderboard', async (ctx) => {
+  await ctx.answerCbQuery();
+  await sendLeaderboard(ctx);
 });
 
-bot.help((ctx) =>
-  ctx.reply(
-    `*How the Nexa Referral Program works*\n\n` +
-      `1. Run /start to get your unique invite link\n` +
-      `2. Share it with friends\n` +
-      `3. When they join t.me/${CHANNEL_USERNAME} through YOUR link, you get ${POINTS_PER_REFERRAL} points automatically\n` +
-      `4. Points unlock bigger discounts on Nexa evaluations — check /balance anytime`,
-    { parse_mode: 'Markdown' }
-  )
-);
+bot.action('help', async (ctx) => {
+  await ctx.answerCbQuery();
+  await sendHelp(ctx);
+});
 
 // ---------------------------------------------------------------------------
 // ADMIN COMMANDS
@@ -230,14 +306,6 @@ bot.command('stats', async (ctx) => {
     { parse_mode: 'Markdown' }
   );
 });
-
-// Escapes text for safe use inside Telegram HTML-parse-mode messages
-function escapeHtml(str) {
-  return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
-}
 
 // Filled in once at startup from getMe() — used to build the "DM the bot" link
 let BOT_USERNAME = null;
