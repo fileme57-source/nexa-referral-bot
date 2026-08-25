@@ -29,10 +29,9 @@ const POINTS_FOR_REWARD = POINTS_PER_REFERRAL * REFERRALS_FOR_REWARD;
 // DATABASE (lowdb — simple JSON file, no native deps, easy to host anywhere)
 // ---------------------------------------------------------------------------
 const defaultData = {
-  users: {},           // telegramId -> { id, username, firstName, points, inviteLink, createdAt }
-  invites: {},         // inviteLinkUrl -> telegramId (owner of that link)
-  joins: {},           // telegramId of the JOINER -> { referrerId, joinedAt } (prevents double-crediting)
-  pendingWelcomes: {},  // telegramId of the JOINER -> channel message_id of their welcome post (deleted once they /start the bot)
+  users: {},            // telegramId -> { id, username, firstName, points, referrals, rewarded, isInfluencer, createdAt }
+  joins: {},             // telegramId of the JOINER -> { referrerId, joinedAt } (prevents double-crediting)
+  pendingReferrals: {},  // telegramId of a NOT-YET-JOINED user -> referrerId (recorded when they open the bot via a referral deep link)
 };
 
 const db = await JSONFilePreset('db.json', defaultData);
@@ -48,7 +47,6 @@ async function getOrCreateUser(ctx) {
       referrals: 0,       // count of successful, tracked referrals (drives the reward — separate from raw points)
       rewarded: false,    // becomes true the moment they hit REFERRALS_FOR_REWARD (so we only ever send the coupon once)
       isInfluencer: false,
-      inviteLink: null,
       createdAt: new Date().toISOString(),
     };
     await db.write();
@@ -57,34 +55,29 @@ async function getOrCreateUser(ctx) {
 }
 
 // Escapes text so it's safe to embed inside a Telegram legacy-Markdown message
-// (needed because invite links / usernames / names can contain _, *, `, [ which
+// (needed because links / usernames / names can contain _, *, `, [ which
 // would otherwise be misread as formatting and cause the whole message to fail to send)
 function escapeMarkdown(str) {
   return String(str).replace(/([_*`[])/g, '\\$1');
 }
 
-async function ensureInviteLink(ctx, user) {
-  if (user.inviteLink) return user.inviteLink;
-
-  try {
-    const link = await ctx.telegram.createChatInviteLink(CHANNEL_ID, {
-      name: `ref-${user.id}`.slice(0, 32), // Telegram limits invite link names to 32 chars
-      creates_join_request: false,
-    });
-    user.inviteLink = link.invite_link;
-    db.data.invites[link.invite_link] = user.id;
-    await db.write();
-    return user.inviteLink;
-  } catch (err) {
-    console.error('Failed to create invite link:', err.description || err.message);
-    return null;
-  }
+// A user's referral link now opens the BOT (not the channel) with their ID baked
+// into the /start payload. Opening a bot chat via link always works, even for
+// someone who's never messaged the bot before — that's what lets this double as
+// a "the bot shows up in their DMs" experience. The bot then hands them a button
+// to join the channel, and remembers who referred them until they actually do.
+function buildReferralLink(user) {
+  if (!BOT_USERNAME) return null;
+  return `https://t.me/${BOT_USERNAME}?start=ref_${user.id}`;
 }
 
 // ---------------------------------------------------------------------------
 // BOT
 // ---------------------------------------------------------------------------
 const bot = new Telegraf(BOT_TOKEN);
+
+// Filled in once at startup from getMe() — used to build every referral link
+let BOT_USERNAME = null;
 
 function isAdmin(ctx) {
   return ADMIN_IDS.includes(String(ctx.from.id));
@@ -93,44 +86,63 @@ function isAdmin(ctx) {
 bot.start(async (ctx) => {
   const user = await getOrCreateUser(ctx);
 
-  // If this user still has an unclaimed welcome message sitting in the channel, delete it now
-  const pendingMessageId = db.data.pendingWelcomes[user.id];
-  if (pendingMessageId) {
-    try {
-      await ctx.telegram.deleteMessage(CHANNEL_ID, pendingMessageId);
-    } catch (err) {
-      console.error('Failed to delete welcome message:', err.description || err.message);
-    } finally {
-      delete db.data.pendingWelcomes[user.id];
+  // If they arrived via someone's referral link, ctx.startPayload looks like "ref_123456789".
+  // Remember who referred them — we credit the referrer once this person actually joins the channel.
+  const payload = ctx.startPayload || '';
+  const match = payload.match(/^ref_(\d+)$/);
+  if (match) {
+    const referrerId = match[1];
+    const alreadyJoined = !!db.data.joins[user.id];
+    const alreadyPending = !!db.data.pendingReferrals[user.id];
+    if (referrerId !== user.id && db.data.users[referrerId] && !alreadyJoined && !alreadyPending) {
+      db.data.pendingReferrals[user.id] = referrerId;
       await db.write();
     }
   }
 
-  const link = await ensureInviteLink(ctx, user);
+  const link = buildReferralLink(user);
 
   if (!link) {
-    return ctx.reply(
-      '⚠️ I could not generate your referral link. Please tell the Nexa team — the bot likely needs to be made an admin of the channel with "Invite Users via Link" permission.'
-    );
+    return ctx.reply('⚠️ One moment, still starting up — try /start again in a few seconds.');
   }
 
   await ctx.reply(
     `👋 Welcome to Nexa Prop Firm, ${escapeMarkdown(user.firstName)}!\n\n` +
       `🔗 *Your personal referral link:*\n${escapeMarkdown(link)}\n\n` +
-      `Share it. Every friend who joins the channel through your link earns you *${POINTS_PER_REFERRAL} Nexa Points*.\n\n` +
+      `Share it. Every friend who opens it and joins the channel earns you *${POINTS_PER_REFERRAL} Nexa Points*.\n\n` +
       `🎯 *Refer ${REFERRALS_FOR_REWARD} people (${POINTS_FOR_REWARD} points) and unlock:*\n` +
       `• A *${REWARD_DISCOUNT_PERCENT}% off* coupon code, sent to you instantly\n` +
       `• "Nexa Influencer" status — earn up to *50% commission* on every referral you bring in after that\n\n` +
       `💰 Your balance: *${user.points} points* (${user.referrals}/${REFERRALS_FOR_REWARD} referrals)`,
-    { parse_mode: 'Markdown', ...tradingMenu() }
+    { parse_mode: 'Markdown', ...(await buildMenu(ctx, user)) }
   );
 });
 
 // ---------------------------------------------------------------------------
 // TRADING-STYLE BUTTON MENU
-// Inline keyboard shown under key messages so users can tap instead of typing.
+// Inline keyboard shown under key messages. Which buttons appear depends on
+// whether this person has actually joined the channel yet — checked live
+// against Telegram, not from our own records, so it's always accurate.
 // ---------------------------------------------------------------------------
-function tradingMenu() {
+async function isChannelMember(ctx, userId) {
+  try {
+    const member = await ctx.telegram.getChatMember(CHANNEL_ID, userId);
+    return ['member', 'administrator', 'creator', 'restricted'].includes(member.status);
+  } catch (err) {
+    // If we can't check (e.g. they've never touched the channel at all), treat as not-a-member
+    return false;
+  }
+}
+
+async function buildMenu(ctx, user) {
+  const joinButton = Markup.button.url('✅ Join Nexa Channel', `https://t.me/${CHANNEL_USERNAME}`);
+  const member = await isChannelMember(ctx, user.id);
+
+  if (!member) {
+    // Not in the channel yet — only the join button, nothing else unlocked
+    return Markup.inlineKeyboard([[joinButton]]);
+  }
+
   return Markup.inlineKeyboard([
     [
       Markup.button.callback('📈 MY LINK', 'menu_mylink'),
@@ -142,9 +154,9 @@ function tradingMenu() {
 
 async function sendMyLink(ctx) {
   const user = await getOrCreateUser(ctx);
-  const link = await ensureInviteLink(ctx, user);
-  if (!link) return ctx.reply('⚠️ Could not fetch your link right now, try again shortly.');
-  await ctx.reply(`🔗 *Your referral link:*\n${escapeMarkdown(link)}`, { parse_mode: 'Markdown', ...tradingMenu() });
+  const link = buildReferralLink(user);
+  if (!link) return ctx.reply('⚠️ Still starting up — try again in a few seconds.');
+  await ctx.reply(`🔗 *Your referral link:*\n${escapeMarkdown(link)}`, { parse_mode: 'Markdown', ...(await buildMenu(ctx, user)) });
 }
 
 async function sendBalance(ctx) {
@@ -165,15 +177,16 @@ async function sendBalance(ctx) {
     msg += `\n${remaining} more referral${remaining === 1 ? '' : 's'} to unlock your *${REWARD_DISCOUNT_PERCENT}% off* coupon and Nexa Influencer status.`;
   }
 
-  await ctx.reply(msg, { parse_mode: 'Markdown', ...tradingMenu() });
+  await ctx.reply(msg, { parse_mode: 'Markdown', ...(await buildMenu(ctx, user)) });
 }
 
 async function sendLeaderboard(ctx) {
+  const user = await getOrCreateUser(ctx);
   const top = Object.values(db.data.users)
     .sort((a, b) => b.points - a.points)
     .slice(0, 10);
 
-  if (top.length === 0) return ctx.reply('No referrals yet — be the first!', tradingMenu());
+  if (top.length === 0) return ctx.reply('No referrals yet — be the first!', await buildMenu(ctx, user));
 
   const medals = ['🥇', '🥈', '🥉'];
   const lines = top.map((u, i) => {
@@ -182,19 +195,21 @@ async function sendLeaderboard(ctx) {
     return `${rank} ${name} — ${u.points} pts`;
   });
 
-  await ctx.reply(`🏆 *Top Referrers*\n\n${lines.join('\n')}`, { parse_mode: 'Markdown', ...tradingMenu() });
+  await ctx.reply(`🏆 *Top Referrers*\n\n${lines.join('\n')}`, { parse_mode: 'Markdown', ...(await buildMenu(ctx, user)) });
 }
 
 async function sendHelp(ctx) {
+  const user = await getOrCreateUser(ctx);
   await ctx.reply(
     `*How the Nexa Referral Program works*\n\n` +
-      `1. Run /start to get your unique invite link\n` +
+      `1. Run /start to get your unique link\n` +
       `2. Share it with friends\n` +
-      `3. When they join t.me/${CHANNEL_USERNAME} through YOUR link, you get ${POINTS_PER_REFERRAL} points automatically\n` +
-      `4. Refer ${REFERRALS_FOR_REWARD} people and you instantly get a *${REWARD_DISCOUNT_PERCENT}% off* coupon code for ${PLANS_URL}\n` +
-      `5. You also become a *Nexa Influencer*, earning up to 50% commission on every referral after that\n\n` +
+      `3. When they tap it, it opens this bot for them — then they tap "Join Nexa Channel"\n` +
+      `4. The moment they join, you get ${POINTS_PER_REFERRAL} points automatically\n` +
+      `5. Refer ${REFERRALS_FOR_REWARD} people and you instantly get a *${REWARD_DISCOUNT_PERCENT}% off* coupon code for ${PLANS_URL}\n` +
+      `6. You also become a *Nexa Influencer*, earning up to 50% commission on every referral after that\n\n` +
       `Check your progress anytime with the buttons below.`,
-    { parse_mode: 'Markdown', ...tradingMenu() }
+    { parse_mode: 'Markdown', ...(await buildMenu(ctx, user)) }
   );
 }
 
@@ -288,13 +303,11 @@ bot.command('resetleaderboard', async (ctx) => {
     user.isInfluencer = false;
   }
   db.data.joins = {};
+  db.data.pendingReferrals = {};
   await db.write();
 
   await ctx.reply('✅ Leaderboard reset. Everyone is back to 0 points — referral links still work as before.');
 });
-
-// Filled in once at startup from getMe() — used to build the "DM the bot" link
-let BOT_USERNAME = null;
 
 // ---------------------------------------------------------------------------
 // CORE TRACKING LOGIC
@@ -315,34 +328,32 @@ bot.on('chat_member', async (ctx) => {
     const joiner = update.new_chat_member.user;
     const joinerId = String(joiner.id);
 
-    // Post a welcome message in the channel pointing the new member to the bot,
-    // regardless of whether we can attribute them to a referrer.
-    if (BOT_USERNAME) {
-      try {
-        const sent = await ctx.telegram.sendMessage(
-          CHANNEL_ID,
-          `Welcome to Nexa! \n\n` +
-            `Want to earn rewards? DM me @${BOT_USERNAME} and tap Start to get your own referral link — every friend who joins through it earns you Nexa Points toward a discount to get a prop firm account.`
-        );
-        // Remember this message so we can delete it once they actually /start the bot
-        db.data.pendingWelcomes[joinerId] = sent.message_id;
-        await db.write();
-      } catch (err) {
-        console.error('Failed to post welcome message:', err.description || err.message);
-      }
+    // Try to DM the new member directly. This only succeeds if they've already
+    // messaged the bot before (Telegram blocks bots from cold-DMing anyone) —
+    // there's no channel fallback here, so people who joined via the raw public
+    // channel link (not through the bot) simply won't receive this one.
+    try {
+      await ctx.telegram.sendMessage(
+        joinerId,
+        `🎁 Welcome to Nexasave! 😊\n` +
+          `Get your referral link and earn Nexa Points every time a friend joins through you.\n` +
+          `Use your points toward prop firm evaluation discounts — up to 70% OFF! 🔥`
+      );
+    } catch (err) {
+      console.log(`Could not DM new joiner ${joinerId} (likely joined without starting the bot):`, err.description || err.message);
     }
 
-    const inviteLinkUsed = update.invite_link?.invite_link;
-    if (!inviteLinkUsed) return; // joined without a tracked link (e.g. public link, admin add)
-
-    const referrerId = db.data.invites[inviteLinkUsed];
-    if (!referrerId) return; // link not in our records
+    // Attribution now comes from pendingReferrals (set in /start when they opened
+    // the bot via someone's ref_ link), not from which channel invite link was used.
+    const referrerId = db.data.pendingReferrals[joinerId];
+    if (!referrerId) return; // joined directly, or opened the bot without a referral payload
 
     // Prevent self-referral and double-crediting on leave/rejoin
     if (joinerId === referrerId) return;
     if (db.data.joins[joinerId]) return;
 
     db.data.joins[joinerId] = { referrerId, joinedAt: new Date().toISOString() };
+    delete db.data.pendingReferrals[joinerId];
 
     if (db.data.users[referrerId]) {
       const referrer = db.data.users[referrerId];
