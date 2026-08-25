@@ -265,6 +265,34 @@ bot.command('influencers', async (ctx) => {
   );
 });
 
+// Wipes everyone's points/referrals/reward status back to zero for a fresh leaderboard.
+// Requires typing CONFIRM after the command so it can't be triggered by accident.
+// Does NOT delete users or their referral links — people keep the same /mylink,
+// it just starts counting from 0 again.
+bot.command('resetleaderboard', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  const [, confirmation] = ctx.message.text.split(' ');
+
+  if (confirmation !== 'CONFIRM') {
+    return ctx.reply(
+      '⚠️ This wipes everyone\'s points, referral counts, coupon-unlock status, and Nexa Influencer status back to zero.\n\n' +
+        'Referral links stay the same, so no one needs to /start again.\n\n' +
+        'To confirm, send:\n/resetleaderboard CONFIRM'
+    );
+  }
+
+  for (const user of Object.values(db.data.users)) {
+    user.points = 0;
+    user.referrals = 0;
+    user.rewarded = false;
+    user.isInfluencer = false;
+  }
+  db.data.joins = {};
+  await db.write();
+
+  await ctx.reply('✅ Leaderboard reset. Everyone is back to 0 points — referral links still work as before.');
+});
+
 // Filled in once at startup from getMe() — used to build the "DM the bot" link
 let BOT_USERNAME = null;
 
