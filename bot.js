@@ -56,6 +56,13 @@ async function getOrCreateUser(ctx) {
   return db.data.users[id];
 }
 
+// Escapes text so it's safe to embed inside a Telegram legacy-Markdown message
+// (needed because invite links / usernames / names can contain _, *, `, [ which
+// would otherwise be misread as formatting and cause the whole message to fail to send)
+function escapeMarkdown(str) {
+  return String(str).replace(/([_*`[])/g, '\\$1');
+}
+
 async function ensureInviteLink(ctx, user) {
   if (user.inviteLink) return user.inviteLink;
 
@@ -108,8 +115,8 @@ bot.start(async (ctx) => {
   }
 
   await ctx.reply(
-    `👋 Welcome to Nexa Prop Firm, ${user.firstName}!\n\n` +
-      `🔗 *Your personal referral link:*\n${link}\n\n` +
+    `👋 Welcome to Nexa Prop Firm, ${escapeMarkdown(user.firstName)}!\n\n` +
+      `🔗 *Your personal referral link:*\n${escapeMarkdown(link)}\n\n` +
       `Share it. Every friend who joins the channel through your link earns you *${POINTS_PER_REFERRAL} Nexa Points*.\n\n` +
       `🎯 *Refer ${REFERRALS_FOR_REWARD} people (${POINTS_FOR_REWARD} points) and unlock:*\n` +
       `• A *${REWARD_DISCOUNT_PERCENT}% off* coupon code, sent to you instantly\n` +
@@ -128,10 +135,7 @@ function tradingMenu() {
     [
       Markup.button.callback('📈 MY LINK', 'menu_mylink'),
       Markup.button.callback('💰 BALANCE', 'menu_balance'),
-    ],
-    [
       Markup.button.callback('🏆 LEADERBOARD', 'menu_leaderboard'),
-      Markup.button.callback('📘 HELP', 'menu_help'),
     ],
   ]);
 }
@@ -140,7 +144,7 @@ async function sendMyLink(ctx) {
   const user = await getOrCreateUser(ctx);
   const link = await ensureInviteLink(ctx, user);
   if (!link) return ctx.reply('⚠️ Could not fetch your link right now, try again shortly.');
-  await ctx.reply(`🔗 *Your referral link:*\n${link}`, { parse_mode: 'Markdown', ...tradingMenu() });
+  await ctx.reply(`🔗 *Your referral link:*\n${escapeMarkdown(link)}`, { parse_mode: 'Markdown', ...tradingMenu() });
 }
 
 async function sendBalance(ctx) {
@@ -158,7 +162,7 @@ async function sendBalance(ctx) {
       `⭐ You're a *Nexa Influencer* — keep sharing your link to earn commission on every referral from here on.`;
   } else {
     const remaining = REFERRALS_FOR_REWARD - user.referrals;
-    msg += `\n${remaining} more referral${remaining === 1 ? '' : 's'} to unlock your *${REWARD_DISCOUNT_PERCENT}% off* coupon (${COUPON_CODE}) and Nexa Influencer status.`;
+    msg += `\n${remaining} more referral${remaining === 1 ? '' : 's'} to unlock your *${REWARD_DISCOUNT_PERCENT}% off* coupon and Nexa Influencer status.`;
   }
 
   await ctx.reply(msg, { parse_mode: 'Markdown', ...tradingMenu() });
@@ -173,7 +177,7 @@ async function sendLeaderboard(ctx) {
 
   const medals = ['🥇', '🥈', '🥉'];
   const lines = top.map((u, i) => {
-    const name = u.firstName || 'Anonymous';
+    const name = escapeMarkdown(u.firstName || 'Anonymous');
     const rank = medals[i] || `${i + 1}.`;
     return `${rank} ${name} — ${u.points} pts`;
   });
@@ -187,7 +191,7 @@ async function sendHelp(ctx) {
       `1. Run /start to get your unique invite link\n` +
       `2. Share it with friends\n` +
       `3. When they join t.me/${CHANNEL_USERNAME} through YOUR link, you get ${POINTS_PER_REFERRAL} points automatically\n` +
-      `4. Refer ${REFERRALS_FOR_REWARD} people and you instantly get a *${REWARD_DISCOUNT_PERCENT}% off* coupon (${COUPON_CODE}) for ${PLANS_URL}\n` +
+      `4. Refer ${REFERRALS_FOR_REWARD} people and you instantly get a *${REWARD_DISCOUNT_PERCENT}% off* coupon code for ${PLANS_URL}\n` +
       `5. You also become a *Nexa Influencer*, earning up to 50% commission on every referral after that\n\n` +
       `Check your progress anytime with the buttons below.`,
     { parse_mode: 'Markdown', ...tradingMenu() }
@@ -203,7 +207,6 @@ bot.help(sendHelp);
 bot.action('menu_mylink', async (ctx) => { await ctx.answerCbQuery(); await sendMyLink(ctx); });
 bot.action('menu_balance', async (ctx) => { await ctx.answerCbQuery(); await sendBalance(ctx); });
 bot.action('menu_leaderboard', async (ctx) => { await ctx.answerCbQuery(); await sendLeaderboard(ctx); });
-bot.action('menu_help', async (ctx) => { await ctx.answerCbQuery(); await sendHelp(ctx); });
 
 // ---------------------------------------------------------------------------
 // ADMIN COMMANDS
@@ -253,7 +256,7 @@ bot.command('influencers', async (ctx) => {
 
   const lines = influencers.map((u) => {
     const handle = u.username ? `@${u.username}` : `id:${u.id}`;
-    return `• ${u.firstName || 'Unknown'} (${handle}) — ${u.referrals} referrals`;
+    return `• ${escapeMarkdown(u.firstName || 'Unknown')} (${handle}) — ${u.referrals} referrals`;
   });
 
   await ctx.reply(
@@ -359,6 +362,15 @@ bot.on('chat_member', async (ctx) => {
 bot.telegram.getMe().then((me) => {
   BOT_USERNAME = me.username;
   console.log(`   Bot username resolved: @${BOT_USERNAME}`);
+});
+
+// Global safety net: if any handler throws (e.g. a formatting error), log it
+// loudly and let the user know something went wrong instead of failing silently.
+bot.catch((err, ctx) => {
+  console.error(`Unhandled error for update ${ctx.updateType}:`, err);
+  if (ctx.chat) {
+    ctx.reply('⚠️ Something went wrong on my end — please try again in a moment.').catch(() => {});
+  }
 });
 
 bot.launch({
