@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { Telegraf } from 'telegraf';
+import { Telegraf, Markup } from 'telegraf';
 import { JSONFilePreset } from 'lowdb/node';
 
 // ---------------------------------------------------------------------------
@@ -114,24 +114,36 @@ bot.start(async (ctx) => {
       `🎯 *Refer ${REFERRALS_FOR_REWARD} people (${POINTS_FOR_REWARD} points) and unlock:*\n` +
       `• A *${REWARD_DISCOUNT_PERCENT}% off* coupon code, sent to you instantly\n` +
       `• "Nexa Influencer" status — earn up to *50% commission* on every referral you bring in after that\n\n` +
-      `💰 Your balance: *${user.points} points* (${user.referrals}/${REFERRALS_FOR_REWARD} referrals)\n\n` +
-      `Commands:\n` +
-      `/mylink – get your referral link again\n` +
-      `/balance – check your progress\n` +
-      `/leaderboard – see the top referrers\n` +
-      `/help – how this works`,
-    { parse_mode: 'Markdown' }
+      `💰 Your balance: *${user.points} points* (${user.referrals}/${REFERRALS_FOR_REWARD} referrals)`,
+    { parse_mode: 'Markdown', ...tradingMenu() }
   );
 });
 
-bot.command('mylink', async (ctx) => {
+// ---------------------------------------------------------------------------
+// TRADING-STYLE BUTTON MENU
+// Inline keyboard shown under key messages so users can tap instead of typing.
+// ---------------------------------------------------------------------------
+function tradingMenu() {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback('📈 MY LINK', 'menu_mylink'),
+      Markup.button.callback('💰 BALANCE', 'menu_balance'),
+    ],
+    [
+      Markup.button.callback('🏆 LEADERBOARD', 'menu_leaderboard'),
+      Markup.button.callback('📘 HELP', 'menu_help'),
+    ],
+  ]);
+}
+
+async function sendMyLink(ctx) {
   const user = await getOrCreateUser(ctx);
   const link = await ensureInviteLink(ctx, user);
   if (!link) return ctx.reply('⚠️ Could not fetch your link right now, try again shortly.');
-  await ctx.reply(`🔗 Your referral link:\n${link}`);
-});
+  await ctx.reply(`🔗 *Your referral link:*\n${link}`, { parse_mode: 'Markdown', ...tradingMenu() });
+}
 
-bot.command('balance', async (ctx) => {
+async function sendBalance(ctx) {
   const user = await getOrCreateUser(ctx);
 
   let msg =
@@ -149,36 +161,49 @@ bot.command('balance', async (ctx) => {
     msg += `\n${remaining} more referral${remaining === 1 ? '' : 's'} to unlock your *${REWARD_DISCOUNT_PERCENT}% off* coupon (${COUPON_CODE}) and Nexa Influencer status.`;
   }
 
-  await ctx.reply(msg, { parse_mode: 'Markdown' });
-});
+  await ctx.reply(msg, { parse_mode: 'Markdown', ...tradingMenu() });
+}
 
-bot.command('leaderboard', async (ctx) => {
+async function sendLeaderboard(ctx) {
   const top = Object.values(db.data.users)
     .sort((a, b) => b.points - a.points)
     .slice(0, 10);
 
-  if (top.length === 0) return ctx.reply('No referrals yet — be the first!');
+  if (top.length === 0) return ctx.reply('No referrals yet — be the first!', tradingMenu());
 
+  const medals = ['🥇', '🥈', '🥉'];
   const lines = top.map((u, i) => {
     const name = u.firstName || 'Anonymous';
-    return `${i + 1}. ${name} — ${u.points} pts`;
+    const rank = medals[i] || `${i + 1}.`;
+    return `${rank} ${name} — ${u.points} pts`;
   });
 
-  await ctx.reply(`🏆 *Top Referrers*\n\n${lines.join('\n')}`, { parse_mode: 'Markdown' });
-});
+  await ctx.reply(`🏆 *Top Referrers*\n\n${lines.join('\n')}`, { parse_mode: 'Markdown', ...tradingMenu() });
+}
 
-bot.help((ctx) =>
-  ctx.reply(
+async function sendHelp(ctx) {
+  await ctx.reply(
     `*How the Nexa Referral Program works*\n\n` +
       `1. Run /start to get your unique invite link\n` +
       `2. Share it with friends\n` +
       `3. When they join t.me/${CHANNEL_USERNAME} through YOUR link, you get ${POINTS_PER_REFERRAL} points automatically\n` +
       `4. Refer ${REFERRALS_FOR_REWARD} people and you instantly get a *${REWARD_DISCOUNT_PERCENT}% off* coupon (${COUPON_CODE}) for ${PLANS_URL}\n` +
       `5. You also become a *Nexa Influencer*, earning up to 50% commission on every referral after that\n\n` +
-      `Check /balance anytime to see your progress.`,
-    { parse_mode: 'Markdown' }
-  )
-);
+      `Check your progress anytime with the buttons below.`,
+    { parse_mode: 'Markdown', ...tradingMenu() }
+  );
+}
+
+bot.command('mylink', sendMyLink);
+bot.command('balance', sendBalance);
+bot.command('leaderboard', sendLeaderboard);
+bot.help(sendHelp);
+
+// Button taps route to the exact same logic as their /command equivalents
+bot.action('menu_mylink', async (ctx) => { await ctx.answerCbQuery(); await sendMyLink(ctx); });
+bot.action('menu_balance', async (ctx) => { await ctx.answerCbQuery(); await sendBalance(ctx); });
+bot.action('menu_leaderboard', async (ctx) => { await ctx.answerCbQuery(); await sendLeaderboard(ctx); });
+bot.action('menu_help', async (ctx) => { await ctx.answerCbQuery(); await sendHelp(ctx); });
 
 // ---------------------------------------------------------------------------
 // ADMIN COMMANDS
@@ -237,14 +262,6 @@ bot.command('influencers', async (ctx) => {
   );
 });
 
-// Escapes text for safe use inside Telegram HTML-parse-mode messages
-function escapeHtml(str) {
-  return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
-}
-
 // Filled in once at startup from getMe() — used to build the "DM the bot" link
 let BOT_USERNAME = null;
 
@@ -266,7 +283,6 @@ bot.on('chat_member', async (ctx) => {
 
     const joiner = update.new_chat_member.user;
     const joinerId = String(joiner.id);
-    const joinerName = escapeHtml(joiner.first_name || joiner.username || 'there');
 
     // Post a welcome message in the channel pointing the new member to the bot,
     // regardless of whether we can attribute them to a referrer.
@@ -274,9 +290,8 @@ bot.on('chat_member', async (ctx) => {
       try {
         const sent = await ctx.telegram.sendMessage(
           CHANNEL_ID,
-          `👋 Welcome, <a href="tg://user?id=${joinerId}">${joinerName}</a>!\n\n` +
-            `Want to earn rewards? DM me @${BOT_USERNAME} and tap Start to get your own referral link — every friend who joins through it earns you Nexa Points toward a discount.`,
-          { parse_mode: 'HTML' }
+          `Welcome to Nexa! \n\n` +
+            `Want to earn rewards? DM me @${BOT_USERNAME} and tap Start to get your own referral link — every friend who joins through it earns you Nexa Points toward a discount to get a prop firm account.`
         );
         // Remember this message so we can delete it once they actually /start the bot
         db.data.pendingWelcomes[joinerId] = sent.message_id;
