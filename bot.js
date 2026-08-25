@@ -362,7 +362,7 @@ bot.telegram.getMe().then((me) => {
 });
 
 bot.launch({
-  allowedUpdates: ['message', 'chat_member', 'my_chat_member'],
+  allowedUpdates: ['message', 'chat_member', 'my_chat_member', 'callback_query'],
 }).then(() => {
   console.log('✅ Nexa Referral Bot is running.');
   console.log(`   Tracking channel: ${CHANNEL_ID} (@${CHANNEL_USERNAME})`);
