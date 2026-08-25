@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { Telegraf, Markup } from 'telegraf';
+import { Telegraf } from 'telegraf';
 import { JSONFilePreset } from 'lowdb/node';
 
 // ---------------------------------------------------------------------------
@@ -8,7 +8,11 @@ import { JSONFilePreset } from 'lowdb/node';
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID; // e.g. -1001234567890
 const CHANNEL_USERNAME = process.env.CHANNEL_USERNAME || 'nexapropfirm';
-const POINTS_PER_REFERRAL = parseInt(process.env.POINTS_PER_REFERRAL || '10', 10);
+const POINTS_PER_REFERRAL = parseInt(process.env.POINTS_PER_REFERRAL || '14', 10);
+const REFERRALS_FOR_REWARD = parseInt(process.env.REFERRALS_FOR_REWARD || '5', 10);
+const REWARD_DISCOUNT_PERCENT = parseInt(process.env.REWARD_DISCOUNT_PERCENT || '70', 10);
+const COUPON_CODE = process.env.COUPON_CODE || 'NEXA7';
+const PLANS_URL = process.env.PLANS_URL || 'https://nexapropfirm.com/plans';
 const ADMIN_IDS = (process.env.ADMIN_IDS || '')
   .split(',')
   .map((id) => id.trim())
@@ -19,57 +23,7 @@ if (!BOT_TOKEN || !CHANNEL_ID) {
   process.exit(1);
 }
 
-// Catch anything that slips through so a single bad send doesn't kill the process
-process.on('unhandledRejection', (err) => {
-  console.error('Unhandled rejection:', err);
-});
-
-// Discount tiers — edit these to match your pricing. Points are cumulative (lifetime).
-// Sorted ascending; the bot picks the highest tier the user qualifies for.
-const DISCOUNT_TIERS = [
-  { points: 0, discount: 0 },
-  { points: 10, discount: 5 },
-  { points: 30, discount: 10 },
-  { points: 60, discount: 15 },
-  { points: 100, discount: 20 },
-  { points: 200, discount: 30 },
-];
-
-function getDiscountForPoints(points) {
-  let tier = DISCOUNT_TIERS[0];
-  for (const t of DISCOUNT_TIERS) {
-    if (points >= t.points) tier = t;
-  }
-  return tier.discount;
-}
-
-function nextTierInfo(points) {
-  const next = DISCOUNT_TIERS.find((t) => t.points > points);
-  if (!next) return null;
-  return { pointsNeeded: next.points - points, discount: next.discount };
-}
-
-// Escapes Markdown special chars (mainly underscores in usernames) so
-// Telegram's parser doesn't choke and reject the whole message.
-function escapeMarkdown(str) {
-  return String(str).replace(/([_*[\]()~`>#+=|{}.!-])/g, '\\$1');
-}
-
-// Escapes text for safe use inside Telegram HTML-parse-mode messages
-function escapeHtml(str) {
-  return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
-}
-
-// Shared inline keyboard shown under the welcome message and reusable elsewhere
-const mainMenuKeyboard = Markup.inlineKeyboard([
-  [Markup.button.callback('🔗 My Link', 'mylink')],
-  [Markup.button.callback('💰 Balance', 'balance')],
-  [Markup.button.callback('🏆 Leaderboard', 'leaderboard')],
-  [Markup.button.callback('❓ Help', 'help')],
-]);
+const POINTS_FOR_REWARD = POINTS_PER_REFERRAL * REFERRALS_FOR_REWARD;
 
 // ---------------------------------------------------------------------------
 // DATABASE (lowdb — simple JSON file, no native deps, easy to host anywhere)
@@ -91,6 +45,9 @@ async function getOrCreateUser(ctx) {
       username: ctx.from.username || null,
       firstName: ctx.from.first_name || '',
       points: 0,
+      referrals: 0,       // count of successful, tracked referrals (drives the reward — separate from raw points)
+      rewarded: false,    // becomes true the moment they hit REFERRALS_FOR_REWARD (so we only ever send the coupon once)
+      isInfluencer: false,
       inviteLink: null,
       createdAt: new Date().toISOString(),
     };
@@ -126,83 +83,6 @@ function isAdmin(ctx) {
   return ADMIN_IDS.includes(String(ctx.from.id));
 }
 
-// ---------------------------------------------------------------------------
-// SHARED HANDLER LOGIC
-// Each of these is called from BOTH the /command version and the button
-// (bot.action) version below, so the behavior always stays in sync.
-// ---------------------------------------------------------------------------
-
-async function sendMyLink(ctx) {
-  const user = await getOrCreateUser(ctx);
-  const link = await ensureInviteLink(ctx, user);
-  if (!link) return ctx.reply('⚠️ Could not fetch your link right now, try again shortly.');
-  await ctx.reply(`🔗 Your referral link:\n${link}`);
-}
-
-async function sendBalance(ctx) {
-  const user = await getOrCreateUser(ctx);
-  const discount = getDiscountForPoints(user.points);
-  const next = nextTierInfo(user.points);
-
-  let msg =
-    `💰 *Nexa Points Balance*\n\n` +
-    `Points: *${user.points}*\n` +
-    `Current discount: *${discount}%*\n`;
-
-  if (next) {
-    msg += `\nEarn *${next.pointsNeeded} more points* to unlock *${next.discount}% off*.`;
-  } else {
-    msg += `\n🏆 You're at the top tier!`;
-  }
-
-  await ctx.reply(msg, { parse_mode: 'Markdown' });
-}
-
-async function sendLeaderboard(ctx) {
-  const top = Object.values(db.data.users)
-    .sort((a, b) => b.points - a.points)
-    .slice(0, 10);
-
-  if (top.length === 0) return ctx.reply('No referrals yet — be the first!');
-
-  const lines = top.map((u, i) => {
-    // Escape the name so a stray "_" (like @scientist_te) can't break
-    // Telegram's Markdown parser and crash the send.
-    const rawName = u.username ? `@${u.username}` : u.firstName || 'Anonymous';
-    const name = escapeMarkdown(rawName);
-    return `${i + 1}. ${name} — ${u.points} pts`;
-  });
-
-  const text = `🏆 *Top Referrers*\n\n${lines.join('\n')}`;
-
-  try {
-    await ctx.reply(text, { parse_mode: 'Markdown' });
-  } catch (err) {
-    console.error('Failed to send leaderboard (Markdown), retrying as plain text:', err.description || err.message);
-    try {
-      // Fallback: strip all formatting so a bad character can never crash this again
-      await ctx.reply(text.replace(/[_*[\]()~`>#+=|{}.!\\-]/g, ''));
-    } catch (fallbackErr) {
-      console.error('Leaderboard fallback send also failed:', fallbackErr.description || fallbackErr.message);
-    }
-  }
-}
-
-async function sendHelp(ctx) {
-  await ctx.reply(
-    `*How the Nexa Referral Program works*\n\n` +
-      `1. Run /start to get your unique invite link\n` +
-      `2. Share it with friends\n` +
-      `3. When they join t.me/${CHANNEL_USERNAME} through YOUR link, you get ${POINTS_PER_REFERRAL} points automatically\n` +
-      `4. Points unlock bigger discounts on Nexa evaluations — check /balance anytime`,
-    { parse_mode: 'Markdown' }
-  );
-}
-
-// ---------------------------------------------------------------------------
-// COMMANDS (typed by user)
-// ---------------------------------------------------------------------------
-
 bot.start(async (ctx) => {
   const user = await getOrCreateUser(ctx);
 
@@ -227,45 +107,78 @@ bot.start(async (ctx) => {
     );
   }
 
-  const discount = getDiscountForPoints(user.points);
-
   await ctx.reply(
     `👋 Welcome to Nexa Prop Firm, ${user.firstName}!\n\n` +
       `🔗 *Your personal referral link:*\n${link}\n\n` +
-      `Share this link. When someone joins the channel through it, you automatically earn *${POINTS_PER_REFERRAL} Nexa Points*.\n\n` +
-      `💰 Your current balance: *${user.points} points* → *${discount}% discount*`,
-    { parse_mode: 'Markdown', ...mainMenuKeyboard }
+      `Share it. Every friend who joins the channel through your link earns you *${POINTS_PER_REFERRAL} Nexa Points*.\n\n` +
+      `🎯 *Refer ${REFERRALS_FOR_REWARD} people (${POINTS_FOR_REWARD} points) and unlock:*\n` +
+      `• A *${REWARD_DISCOUNT_PERCENT}% off* coupon code, sent to you instantly\n` +
+      `• "Nexa Influencer" status — earn up to *50% commission* on every referral you bring in after that\n\n` +
+      `💰 Your balance: *${user.points} points* (${user.referrals}/${REFERRALS_FOR_REWARD} referrals)\n\n` +
+      `Commands:\n` +
+      `/mylink – get your referral link again\n` +
+      `/balance – check your progress\n` +
+      `/leaderboard – see the top referrers\n` +
+      `/help – how this works`,
+    { parse_mode: 'Markdown' }
   );
 });
 
-bot.command('mylink', sendMyLink);
-bot.command('balance', sendBalance);
-bot.command('leaderboard', sendLeaderboard);
-bot.help(sendHelp);
-
-// ---------------------------------------------------------------------------
-// BUTTON TAPS (inline keyboard callbacks)
-// ---------------------------------------------------------------------------
-
-bot.action('mylink', async (ctx) => {
-  await ctx.answerCbQuery();
-  await sendMyLink(ctx);
+bot.command('mylink', async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  const link = await ensureInviteLink(ctx, user);
+  if (!link) return ctx.reply('⚠️ Could not fetch your link right now, try again shortly.');
+  await ctx.reply(`🔗 Your referral link:\n${link}`);
 });
 
-bot.action('balance', async (ctx) => {
-  await ctx.answerCbQuery();
-  await sendBalance(ctx);
+bot.command('balance', async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+
+  let msg =
+    `💰 *Nexa Points Balance*\n\n` +
+    `Points: *${user.points}*\n` +
+    `Referrals: *${user.referrals}/${REFERRALS_FOR_REWARD}*\n`;
+
+  if (user.rewarded) {
+    msg +=
+      `\n🏆 You've unlocked your *${REWARD_DISCOUNT_PERCENT}% off* coupon: *${COUPON_CODE}*\n` +
+      `Use it here: ${PLANS_URL}\n\n` +
+      `⭐ You're a *Nexa Influencer* — keep sharing your link to earn commission on every referral from here on.`;
+  } else {
+    const remaining = REFERRALS_FOR_REWARD - user.referrals;
+    msg += `\n${remaining} more referral${remaining === 1 ? '' : 's'} to unlock your *${REWARD_DISCOUNT_PERCENT}% off* coupon (${COUPON_CODE}) and Nexa Influencer status.`;
+  }
+
+  await ctx.reply(msg, { parse_mode: 'Markdown' });
 });
 
-bot.action('leaderboard', async (ctx) => {
-  await ctx.answerCbQuery();
-  await sendLeaderboard(ctx);
+bot.command('leaderboard', async (ctx) => {
+  const top = Object.values(db.data.users)
+    .sort((a, b) => b.points - a.points)
+    .slice(0, 10);
+
+  if (top.length === 0) return ctx.reply('No referrals yet — be the first!');
+
+  const lines = top.map((u, i) => {
+    const name = u.firstName || 'Anonymous';
+    return `${i + 1}. ${name} — ${u.points} pts`;
+  });
+
+  await ctx.reply(`🏆 *Top Referrers*\n\n${lines.join('\n')}`, { parse_mode: 'Markdown' });
 });
 
-bot.action('help', async (ctx) => {
-  await ctx.answerCbQuery();
-  await sendHelp(ctx);
-});
+bot.help((ctx) =>
+  ctx.reply(
+    `*How the Nexa Referral Program works*\n\n` +
+      `1. Run /start to get your unique invite link\n` +
+      `2. Share it with friends\n` +
+      `3. When they join t.me/${CHANNEL_USERNAME} through YOUR link, you get ${POINTS_PER_REFERRAL} points automatically\n` +
+      `4. Refer ${REFERRALS_FOR_REWARD} people and you instantly get a *${REWARD_DISCOUNT_PERCENT}% off* coupon (${COUPON_CODE}) for ${PLANS_URL}\n` +
+      `5. You also become a *Nexa Influencer*, earning up to 50% commission on every referral after that\n\n` +
+      `Check /balance anytime to see your progress.`,
+    { parse_mode: 'Markdown' }
+  )
+);
 
 // ---------------------------------------------------------------------------
 // ADMIN COMMANDS
@@ -301,11 +214,36 @@ bot.command('stats', async (ctx) => {
   const totalUsers = Object.keys(db.data.users).length;
   const totalJoins = Object.keys(db.data.joins).length;
   const totalPoints = Object.values(db.data.users).reduce((sum, u) => sum + u.points, 0);
+  const totalInfluencers = Object.values(db.data.users).filter((u) => u.isInfluencer).length;
   await ctx.reply(
-    `📊 *Nexa Referral Stats*\n\nRegistered users: ${totalUsers}\nSuccessful referrals: ${totalJoins}\nTotal points issued: ${totalPoints}`,
+    `📊 *Nexa Referral Stats*\n\nRegistered users: ${totalUsers}\nSuccessful referrals: ${totalJoins}\nTotal points issued: ${totalPoints}\nNexa Influencers: ${totalInfluencers}`,
     { parse_mode: 'Markdown' }
   );
 });
+
+bot.command('influencers', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  const influencers = Object.values(db.data.users).filter((u) => u.isInfluencer);
+  if (influencers.length === 0) return ctx.reply('No Nexa Influencers yet.');
+
+  const lines = influencers.map((u) => {
+    const handle = u.username ? `@${u.username}` : `id:${u.id}`;
+    return `• ${u.firstName || 'Unknown'} (${handle}) — ${u.referrals} referrals`;
+  });
+
+  await ctx.reply(
+    `⭐ *Nexa Influencers* (for manual commission payout)\n\n${lines.join('\n')}`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+// Escapes text for safe use inside Telegram HTML-parse-mode messages
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
 
 // Filled in once at startup from getMe() — used to build the "DM the bot" link
 let BOT_USERNAME = null;
@@ -361,16 +299,38 @@ bot.on('chat_member', async (ctx) => {
     db.data.joins[joinerId] = { referrerId, joinedAt: new Date().toISOString() };
 
     if (db.data.users[referrerId]) {
-      db.data.users[referrerId].points += POINTS_PER_REFERRAL;
+      const referrer = db.data.users[referrerId];
+      referrer.points += POINTS_PER_REFERRAL;
+      referrer.referrals += 1;
       await db.write();
 
       try {
         await ctx.telegram.sendMessage(
           referrerId,
-          `🎉 Someone just joined Nexa through your referral link!\n+${POINTS_PER_REFERRAL} Nexa Points added.\n\nCheck /balance to see your discount tier.`
+          `🎉 Someone just joined Nexa through your referral link!\n+${POINTS_PER_REFERRAL} Nexa Points added.\n\nReferrals: ${referrer.referrals}/${REFERRALS_FOR_REWARD}\nCheck /balance to see your progress.`
         );
       } catch {
         // Referrer may have blocked the bot — ignore, points are still credited
+      }
+
+      // Milestone check — fires exactly once, the moment they cross the referral threshold
+      if (referrer.referrals >= REFERRALS_FOR_REWARD && !referrer.rewarded) {
+        referrer.rewarded = true;
+        referrer.isInfluencer = true;
+        await db.write();
+
+        try {
+          await ctx.telegram.sendMessage(
+            referrerId,
+            `🎉🔥 Congratulations! You've hit ${REFERRALS_FOR_REWARD} referrals!\n\n` +
+              `🎟 Your coupon code: *${COUPON_CODE}* (${REWARD_DISCOUNT_PERCENT}% off)\n` +
+              `Use it here to get your evaluation account: ${PLANS_URL}\n\n` +
+              `⭐ You're now a *Nexa Influencer*! Keep sharing your referral link — you can earn up to *50% commission* on every referral you bring in from here on. Our team will be in touch about commission payouts.`,
+            { parse_mode: 'Markdown' }
+          );
+        } catch {
+          // Referrer may have blocked the bot — reward is still recorded, admins can see it via /influencers
+        }
       }
     }
   } catch (err) {
@@ -387,7 +347,7 @@ bot.telegram.getMe().then((me) => {
 });
 
 bot.launch({
-  allowedUpdates: ['message', 'chat_member', 'my_chat_member', 'callback_query'],
+  allowedUpdates: ['message', 'chat_member', 'my_chat_member'],
 }).then(() => {
   console.log('✅ Nexa Referral Bot is running.');
   console.log(`   Tracking channel: ${CHANNEL_ID} (@${CHANNEL_USERNAME})`);
