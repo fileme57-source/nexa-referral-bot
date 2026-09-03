@@ -204,7 +204,7 @@ async function sendLeaderboard(ctx) {
 
   const top = Object.values(db.data.users)
     .sort((a, b) => b.points - a.points)
-    .slice(0, 10);
+    .slice(0, 12);
 
   if (top.length === 0) return ctx.reply('No referrals yet — be the first!', fullMenu());
 
@@ -331,56 +331,54 @@ bot.command('resetleaderboard', async (ctx) => {
   await ctx.reply('✅ Leaderboard reset. Everyone is back to 0 points — referral links still work as before.');
 });
 
-// A pool of 60 distinct first names used to populate the leaderboard.
-const SEED_NAMES = [
-  'Ahmed', 'Grace', 'Kwame', 'Liam', 'Amara', 'Noah', 'Fatima', 'Ethan', 'Chidi', 'Olivia',
-  'Yusuf', 'Ava', 'Zainab', 'Mason', 'Ngozi', 'Sofia', 'Tunde', 'Isabella', 'Aisha', 'Lucas',
-  'Ifeoma', 'Mia', 'Bola', 'Elijah', 'Amina', 'Charlotte', 'Emeka', 'Amelia', 'Halima', 'James',
-  'Chioma', 'Harper', 'Musa', 'Evelyn', 'Adaeze', 'Benjamin', 'Hauwa', 'Abigail', 'Segun', 'Emily',
-  'Nneka', 'Daniel', 'Rasheed', 'Ella', 'Uche', 'Michael', 'Zara', 'William', 'Adeola', 'Scarlett',
-  'Ibrahim', 'Victoria', 'Kemi', 'Alexander', 'Sadia', 'Femi', 'Camila', 'Tobi', 'Layla', 'David',
+// 11 US/UK leaderboard entries, points ranging from 70 (lower limit) to 980 (upper limit).
+const SEED_LEADERS = [
+  { name: 'Michael', points: 980 },
+  { name: 'James', points: 896 },
+  { name: 'Sarah', points: 812 },
+  { name: 'Emily', points: 728 },
+  { name: 'David', points: 644 },
+  { name: 'Oliver', points: 560 },
+  { name: 'Jessica', points: 476 },
+  { name: 'Charlotte', points: 392 },
+  { name: 'Christopher', points: 308 },
+  { name: 'Amanda', points: 140 },
+  { name: 'Olivia', points: 70 },
 ];
 
-// Populates the leaderboard with 60 entries, points spread from 14,000 down to 70.
+// Populates the leaderboard with the 12 entries above.
 bot.command('seedleaderboard', async (ctx) => {
   if (!isAdmin(ctx)) return;
   const [, confirmation] = ctx.message.text.split(' ');
 
   if (confirmation !== 'CONFIRM') {
     return ctx.reply(
-      '⚠️ This adds 60 entries to the leaderboard (14,000 down to 70 points).\n\n' +
+      `⚠️ This adds ${SEED_LEADERS.length} entries to the leaderboard (${SEED_LEADERS[SEED_LEADERS.length - 1].points} to ${SEED_LEADERS[0].points} points).\n\n` +
         'Remove them anytime with /unseedleaderboard.\n\n' +
         'To confirm, send:\n/seedleaderboard CONFIRM'
     );
   }
 
-  const MAX_REFERRALS = 1000; // 1000 x 14 = 14,000 points, for the #1 spot
-  const MIN_REFERRALS = REFERRALS_FOR_REWARD; // 5 x 14 = 70 points, for the #60 spot
-  const count = SEED_NAMES.length;
-
-  for (let i = 0; i < count; i++) {
-    const progress = i / (count - 1); // 0 = top of the board, 1 = bottom
-    // Curved falloff so a few names sit near the top and most cluster lower — reads like a real leaderboard
-    const referrals = Math.round(MIN_REFERRALS + (MAX_REFERRALS - MIN_REFERRALS) * Math.pow(1 - progress, 2.5));
-    const points = referrals * POINTS_PER_REFERRAL;
+  SEED_LEADERS.forEach((leader, i) => {
+    const referrals = Math.round(leader.points / POINTS_PER_REFERRAL);
     const id = `seed_${i + 1}`;
 
     db.data.users[id] = {
       id,
       username: null,
-      firstName: SEED_NAMES[i],
-      points,
+      firstName: leader.name,
+      points: leader.points,
       referrals,
       rewarded: referrals >= REFERRALS_FOR_REWARD,
       isInfluencer: referrals >= REFERRALS_FOR_REWARD,
       createdAt: new Date().toISOString(),
       seed: true, // internal-only marker so /unseedleaderboard can find and remove these later
     };
-  }
+  });
   await db.write();
 
   await ctx.reply(
-    `✅ Added ${count} entries — top spot at ${MAX_REFERRALS * POINTS_PER_REFERRAL} points, bottom at ${MIN_REFERRALS * POINTS_PER_REFERRAL} points.\n\n` +
+    `✅ Added ${SEED_LEADERS.length} entries — top spot at ${SEED_LEADERS[0].points} points, bottom at ${SEED_LEADERS[SEED_LEADERS.length - 1].points} points.\n\n` +
       `Check /leaderboard. Run /unseedleaderboard if you ever want to clear them.`
   );
 });
