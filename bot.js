@@ -331,6 +331,73 @@ bot.command('resetleaderboard', async (ctx) => {
   await ctx.reply('✅ Leaderboard reset. Everyone is back to 0 points — referral links still work as before.');
 });
 
+// A pool of 60 distinct first names used to populate the leaderboard.
+const SEED_NAMES = [
+  'Ahmed', 'Grace', 'Kwame', 'Liam', 'Amara', 'Noah', 'Fatima', 'Ethan', 'Chidi', 'Olivia',
+  'Yusuf', 'Ava', 'Zainab', 'Mason', 'Ngozi', 'Sofia', 'Tunde', 'Isabella', 'Aisha', 'Lucas',
+  'Ifeoma', 'Mia', 'Bola', 'Elijah', 'Amina', 'Charlotte', 'Emeka', 'Amelia', 'Halima', 'James',
+  'Chioma', 'Harper', 'Musa', 'Evelyn', 'Adaeze', 'Benjamin', 'Hauwa', 'Abigail', 'Segun', 'Emily',
+  'Nneka', 'Daniel', 'Rasheed', 'Ella', 'Uche', 'Michael', 'Zara', 'William', 'Adeola', 'Scarlett',
+  'Ibrahim', 'Victoria', 'Kemi', 'Alexander', 'Sadia', 'Femi', 'Camila', 'Tobi', 'Layla', 'David',
+];
+
+// Populates the leaderboard with 60 entries, points spread from 14,000 down to 70.
+bot.command('seedleaderboard', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  const [, confirmation] = ctx.message.text.split(' ');
+
+  if (confirmation !== 'CONFIRM') {
+    return ctx.reply(
+      '⚠️ This adds 60 entries to the leaderboard (14,000 down to 70 points).\n\n' +
+        'Remove them anytime with /unseedleaderboard.\n\n' +
+        'To confirm, send:\n/seedleaderboard CONFIRM'
+    );
+  }
+
+  const MAX_REFERRALS = 1000; // 1000 x 14 = 14,000 points, for the #1 spot
+  const MIN_REFERRALS = REFERRALS_FOR_REWARD; // 5 x 14 = 70 points, for the #60 spot
+  const count = SEED_NAMES.length;
+
+  for (let i = 0; i < count; i++) {
+    const progress = i / (count - 1); // 0 = top of the board, 1 = bottom
+    // Curved falloff so a few names sit near the top and most cluster lower — reads like a real leaderboard
+    const referrals = Math.round(MIN_REFERRALS + (MAX_REFERRALS - MIN_REFERRALS) * Math.pow(1 - progress, 2.5));
+    const points = referrals * POINTS_PER_REFERRAL;
+    const id = `seed_${i + 1}`;
+
+    db.data.users[id] = {
+      id,
+      username: null,
+      firstName: SEED_NAMES[i],
+      points,
+      referrals,
+      rewarded: referrals >= REFERRALS_FOR_REWARD,
+      isInfluencer: referrals >= REFERRALS_FOR_REWARD,
+      createdAt: new Date().toISOString(),
+      seed: true, // internal-only marker so /unseedleaderboard can find and remove these later
+    };
+  }
+  await db.write();
+
+  await ctx.reply(
+    `✅ Added ${count} entries — top spot at ${MAX_REFERRALS * POINTS_PER_REFERRAL} points, bottom at ${MIN_REFERRALS * POINTS_PER_REFERRAL} points.\n\n` +
+      `Check /leaderboard. Run /unseedleaderboard if you ever want to clear them.`
+  );
+});
+
+// Removes every entry created by /seedleaderboard, leaving real users untouched.
+bot.command('unseedleaderboard', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  const seedIds = Object.keys(db.data.users).filter((id) => db.data.users[id].seed);
+
+  if (seedIds.length === 0) return ctx.reply('Nothing to remove.');
+
+  seedIds.forEach((id) => delete db.data.users[id]);
+  await db.write();
+
+  await ctx.reply(`✅ Removed ${seedIds.length} leaderboard entries. Real users are untouched.`);
+});
+
 // ---------------------------------------------------------------------------
 // CORE TRACKING LOGIC
 // Fires whenever someone's membership status changes in the channel.
